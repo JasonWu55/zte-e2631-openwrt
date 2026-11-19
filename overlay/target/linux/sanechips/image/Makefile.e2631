@@ -105,3 +105,35 @@ define Device/cmcc_rax1800-z
   IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
 endef
 TARGET_DEVICES += cmcc_rax1800-z
+
+# ------------------------------------------------------------------
+# CMCC RAX3000-Z (普通版, ZX279128R, parallel Denali NAND).  Sibling of the
+# RAX1800-Z: same SoC variant, same external sw@92300000 + gephy128s stack,
+# byte-for-byte the same 12-partition flash layout (verified on hardware over
+# the serial root shell).  Deltas vs RAX1800-Z: 256 MiB DRAM (not 512) and
+# MT7916 (not MT7915).  OpenWrt owns slot A (kernel0@0x200000 +
+# rootfs0@0xc00000); slot B stays stock and is the rollback path.  Stock U-Boot
+# boots a plain legacy uImage with a 480-byte ZTE header and passes no DTB, so
+# the kernel is comp=0 with the DTB appended (CONFIG_ARM_APPENDED_DTB).
+define Device/cmcc_rax3000-z
+  DEVICE_VENDOR := CMCC
+  DEVICE_MODEL := RAX3000-Z
+  DEVICE_DTS := zx279128r-cmcc-rax3000z
+  DEVICE_DTS_DIR := $(TOPDIR)/target/linux/sanechips/dts
+  KERNEL_SIZE := 4992k
+  KERNEL := kernel-bin | append-dtb | uImage none | check-size $$(KERNEL_SIZE)
+  KERNEL_INITRAMFS := kernel-bin | append-dtb | uImage-ramboot
+  # WiFi is an MT7916AN (14c3:7906/790a): the mt7915e driver binds it but asks
+  # for the mt7916_*.bin firmware set.  kmod-nft-offload wires up the nft
+  # flowtable statement fw4 needs so the PPE path (zx279128s-ppe.c) forwards
+  # established flows without the CPU - this is the "FFE acceleration" the stock
+  # firmware did in software, now done by the mainline flowtable + PPE offload.
+  DEVICE_PACKAGES := kmod-mt7915e kmod-mt7916-firmware uboot-envtools \
+	kmod-nft-offload \
+	kmod-rax1800z-thermal \
+	luci-app-rax1800z-temp luci-i18n-rax1800z-temp-zh-cn \
+	luci luci-i18n-base-zh-cn libustream-mbedtls
+  IMAGES := sysupgrade.bin
+  IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
+endef
+TARGET_DEVICES += cmcc_rax3000-z

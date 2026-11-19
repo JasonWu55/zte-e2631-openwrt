@@ -12,6 +12,12 @@ zte,zxhn-e2631)
 	# the WAN uplink is on its own internal PHY, the three LAN ports follow.
 	ucidef_set_interfaces_lan_wan "lan1 lan2 lan3" "wan"
 	;;
+cmcc,rax3000-z)
+	# 1 WAN + 3 LAN, matching the port labels in the board DTS
+	# (gmac_port0..3 = lan3,lan2,lan1,wan).  Verify the panel mapping on
+	# first boot with `ip link` + the physical jacks.
+	ucidef_set_interfaces_lan_wan "lan1 lan2 lan3" "wan"
+	;;
 *)
 	ucidef_set_interfaces_lan_wan "lan1 lan2 lan3 lan4" "wan"
 	;;

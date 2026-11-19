@@ -91,10 +91,17 @@ ra_v() { echo "sysupgrade: $*"; }
 # copied explicitly; tar/dd/cat/sha256sum are busybox applets already present
 # in the stage2 ramfs but listing them is harmless and guards minimal ramfs.
 RAMFS_COPY_BIN="/sbin/mtd /bin/tar /usr/bin/sha256sum /bin/dd /bin/cat"
-RAMFS_COPY_DATA="/lib/upgrade/rax1800z.verhdr"
 
-RA_VERHDR=/lib/upgrade/rax1800z.verhdr
-RA_TARDIR=/tmp/rax1800z-sysupgrade
+# The 480-byte ZTE version header prepended to the uImage for `bootm
+# 0x440001e0` has the same format on both CMCC boards but different bytes
+# (product string / CRCs), so pick this board's own header.  The RAX3000-Z
+# header was read from THIS unit's mtd3 (magic 0x99999999, product "12871").
+case "$(board_name 2>/dev/null)" in
+	cmcc,rax3000-z) RA_VERHDR=/lib/upgrade/rax3000z.verhdr ;;
+	*)              RA_VERHDR=/lib/upgrade/rax1800z.verhdr ;;
+esac
+RAMFS_COPY_DATA="$RA_VERHDR"
+RA_TARDIR=/tmp/zx279128r-sysupgrade
 
 # All tool calls below use ONLY applets verified present on this board.
 # NOTE: `od`, `stat`, `hexdump` are NOT available as standalone commands; use

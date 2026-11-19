@@ -1,0 +1,356 @@
+// SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
+/*
+ * CMCC RAX3000-Z (普通版) on the Sanechips ZX279128R SoC.
+ *
+ * Derived from the sibling CMCC RAX1800-Z board file (same SoC variant, same
+ * external switch/PHY stack, same flash layout) plus a full reverse-engineer
+ * of THIS unit's stock firmware (UART root shell + Ghidra of the vendor
+ * /kmodule/*.ko).  See re/spec/idm-datapath.md in the RAX3000Z working repo
+ * for the datapath register map that corroborates the mainline driver.
+ *
+ * Confirmed on THIS hardware over the serial root shell (2026-11-20):
+ *  - 256 MiB DRAM  (/proc/meminfo MemTotal 236864 kB; stock bootargs mem=256M)
+ *  - 128 MiB parallel SLC NAND, Denali controller (stock DT
+ *    "denali,denali-nand-dt"); chip is Toshiba TC58BVG0S3 / XT27G01B
+ *  - 12 MTD partitions, byte-for-byte the RAX1800-Z offsets (read from
+ *    /sys/class/mtd/mtd*/offset):
+ *      u-boot        0x00000000  parameter-tags 0x04c00000
+ *      kernel0       0x00200000  usercfg        0x04e00000
+ *      kernel1       0x00700000  others         0x05300000
+ *      rootfs0       0x00c00000  wlan           0x05400000
+ *      rootfs1       0x02c00000  middleware     0x05700000
+ *                                versionbackup  0x05800000
+ *  - stock U-Boot "CMCRV5.1.0", boots with `bootm 0x440001e0` (480-byte ZTE
+ *    version header, magic 0x99999999, ahead of the uImage)
+ *  - WiFi: MT7916AN (PCIe IDs 14c3:7906 main-HIF + 14c3:790a ext-HIF, ONE
+ *    chip across both PCIe links), mt7915e driver + mt7916 firmware
+ *
+ * Differences vs the RAX1800-Z board file this is forked from:
+ *  - 256 MiB DRAM (RAX1800-Z has 512 MiB)
+ *  - MT7916 instead of MT7915
+ *  Everything else (SoC, Denali NAND, sw@92300000 + gephy128s, PCIe, temp
+ *  sensor, reboot) is identical ZX279128R silicon and is reused verbatim.
+ *
+ * STILL A HYPOTHESIS until the first RAM boot (same caveat as RAX1800-Z):
+ *  - the four MDIO PHY addresses (10..13) and the port->label mapping.  The
+ *    vendor fills uni_phy[] at runtime from the stock DT/scan, so it cannot be
+ *    read statically; verify with
+ *      ls /sys/bus/mdio_bus/devices ; dmesg | grep -iE 'gmac|phy'; ip link
+ *    A board whose wired net is wrong is still reachable over serial + WiFi,
+ *    so this does not block the flash path.
+ *
+ * Slot policy: OpenWrt owns slot A (kernel0 + rootfs0); slot B (kernel1 +
+ * rootfs1) stays STOCK and is the rollback path.
+ */
+
+/dts-v1/;
+
+#include "zte/zx279128s.dtsi"
+#include <dt-bindings/gpio/gpio.h>
+
+/ {
+	model = "CMCC RAX3000-Z";
+	compatible = "cmcc,rax3000-z", "zte,zx279128r", "zte,zx279128s";
+
+	aliases {
+		serial0 = &serial0;
+		ethernet0 = &gmac;
+	};
+
+	/*
+	 * Stock U-Boot passes root=/dev/mtdblock<vendor slot B>.
+	 * CONFIG_CMDLINE_FORCE overrides it; ROOTDEV counts partition ROWS in the
+	 * fixed-partitions table below: u-boot=0, u-boot-env=1, kernel=2,
+	 * rootfs=3 -> /dev/mtdblock3.
+	 */
+	chosen {
+		bootargs = "console=ttyAMA0,115200n8 root=/dev/mtdblock3 rootfstype=squashfs ro rootwait";
+	};
+
+	/* THIS unit: 256 MiB.  Stock DT /memory reg = <0x40000000 0x10000000>. */
+	memory@40000000 {
+		device_type = "memory";
+		reg = <0x40000000 0x10000000>;
+	};
+
+	/*
+	 * Three fixed-clocks for the mainline Denali driver (it calls
+	 * devm_clk_get_enabled() for "nand"/"nand_x"/"ecc" and derives timing
+	 * from their rates).  denali_setup_data_interface() rejects probe unless
+	 * mult_x = clk_x_rate / clk_rate is in [4,6]; 50 MHz core / 200 MHz bus
+	 * gives mult_x = 4.  Same values proven on the RAX1800-Z (same Denali
+	 * controller); the NAND chip differs but the controller timing does not.
+	 */
+	nand_clk: nand-clk {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <50000000>;
+	};
+
+	nand_x_clk: nand-x-clk {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <200000000>;
+	};
+
+	nand_ecc_clk: nand-ecc-clk {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <200000000>;
+	};
+};
+
+/* The console UART - without this the kernel goes silent at "Starting kernel". */
+&serial0 {
+	status = "okay";
+};
+
+&serial1 {
+	status = "okay";
+};
+
+/*
+ * Parallel NAND via the mainline Denali DT driver.  Register addresses / IRQ /
+ * reg-names come from the stock vendor DT (same as RAX1800-Z).  fixed-partitions
+ * must live one level deeper, inside a chip node, because denali_dt_chip_init()
+ * walks every DIRECT child as a NAND chip.
+ */
+&{/soc} {
+	nand@00d80000 {
+		compatible = "denali,denali-nand-dt";
+		reg = <0x00d80000 0x07c00000>, <0x00d00000 0x00080000>;
+		reg-names = "nand_data", "denali_reg";
+		interrupts = <0 20 4>;
+		clocks = <&nand_clk>, <&nand_x_clk>, <&nand_ecc_clk>;
+		clock-names = "nand", "nand_x", "ecc";
+		dma-mask = <0xffffffff>;
+		status = "okay";
+
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		nand@0 {
+			reg = <0>;
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			/* 0x00000000-0x00180000: U-Boot code. NEVER write this. */
+			u_boot: partition@0 {
+				label = "u-boot";
+				reg = <0x00000000 0x00180000>;
+				read-only;
+			};
+
+			/* 0x00180000-0x001a0000: live U-Boot env (128 KiB, CRC-checked).
+			 * Kept writable so fw_setenv can switch the boot slot. */
+			u_boot_env: partition@180000 {
+				label = "u-boot-env";
+				reg = <0x00180000 0x00020000>;
+			};
+
+			/* ---- slot A: OpenWrt ---- */
+			partition@200000 {
+				label = "kernel";
+				reg = <0x00200000 0x00500000>;
+			};
+
+			/* squashfs lands here; erase blocks behind it become the
+			 * writable rootfs_data overlay (mainline squashfs-split). */
+			partition@c00000 {
+				label = "rootfs";
+				reg = <0x00c00000 0x02000000>;
+			};
+
+			/* ---- slot B: untouched stock system (rollback) ---- */
+			kernel1_b: partition@700000 {
+				label = "kernel1-stock";
+				reg = <0x00700000 0x00500000>;
+				read-only;
+			};
+
+			rootfs1_b: partition@2c00000 {
+				label = "rootfs1-stock";
+				reg = <0x02c00000 0x02000000>;
+				read-only;
+			};
+
+			/* ---- vendor data areas ---- */
+			partition@4c00000 {
+				label = "parameter-tags";
+				reg = <0x04c00000 0x00200000>;
+			};
+
+			partition@4e00000 {
+				label = "usercfg";
+				reg = <0x04e00000 0x00500000>;
+			};
+
+			/* BootPara lives in the first 72 bytes of this partition */
+			partition@5300000 {
+				label = "others";
+				reg = <0x05300000 0x00100000>;
+			};
+
+			partition@5400000 {
+				label = "wlan";
+				reg = <0x05400000 0x00300000>;
+			};
+
+			partition@5700000 {
+				label = "middleware";
+				reg = <0x05700000 0x00100000>;
+			};
+
+			partition@5800000 {
+				label = "versionbackup";
+				reg = <0x05800000 0x02000000>;
+			};
+		};
+		};  /* nand@0 chip node */
+	};
+};
+
+/*
+ * ETHERNET.  External switch block (sw@92300000, "zte,zx279127-sw") plus four
+ * gephy128s windows, driven by zx279128s-ppe.c.  Enable four ports the way the
+ * sibling boards do; the fifth stays off.  Port->label and PHY addresses are
+ * the RAX1800-Z hypothesis (verify on first RAM boot - see header).
+ */
+&gmac {
+	status = "okay";
+};
+
+&gmac_port0 {
+	label = "lan3";
+	phy-handle = <&phy10>;
+	phy-mode = "internal";
+	status = "okay";
+};
+
+&gmac_port1 {
+	label = "lan2";
+	phy-handle = <&phy11>;
+	phy-mode = "internal";
+	status = "okay";
+};
+
+&gmac_port2 {
+	label = "lan1";
+	phy-handle = <&phy12>;
+	phy-mode = "internal";
+	status = "okay";
+};
+
+&gmac_port3 {
+	label = "wan";
+	phy-handle = <&phy13>;
+	phy-mode = "internal";
+	status = "okay";
+};
+
+&gmac_port4 {
+	status = "disabled";
+};
+
+&mdio {
+	status = "okay";
+
+	phy10: ethernet-phy@a {
+		reg = <10>;
+	};
+
+	phy11: ethernet-phy@b {
+		reg = <11>;
+	};
+
+	phy12: ethernet-phy@c {
+		reg = <12>;
+	};
+
+	phy13: ethernet-phy@d {
+		reg = <13>;
+	};
+};
+
+/*
+ * WiFi: MT7916AN on PCIe (stock /kmodule/mt7916_ap.ko confirms the chip; the
+ * same 14c3:7906 + 14c3:790a pair the E2631 uses = one chip, main HIF on one
+ * PCIe link + ext HIF on the other).  The vendor wlan partition may start all
+ * 0xFF, so mt76 falls back to OTP/placeholder calibration - bring this up with
+ * the serial console attached before trusting it.
+ */
+/ {
+	soc {
+		/*
+		 * SoC on-die temperature sensor (crm2+0x34, recovered from the
+		 * OEM 4.1.25 temp_zx.c).  kmod-rax1800z-thermal binds here and
+		 * registers a hwmon temp1_input.  Same die as RAX1800-Z.
+		 */
+		temp@94100034 {
+			compatible = "zxic,tempsensor";
+			reg = <0x94100034 0x0000000c>;
+			status = "okay";
+		};
+
+		/*
+		 * Second handle for the 0x94000000 block: topcrm is claimed by
+		 * CLK_OF_DECLARE / OF_POPULATED, so of_platform_bus_create will
+		 * not descend to its children (pcie phys, syscon-reboot).  A
+		 * syscon+simple-mfd duplicate lets the bus walk populate them.
+		 */
+		crm1: syscon@94000000 {
+			compatible = "syscon", "simple-mfd";
+			reg = <0x94000000 0x1000>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			crm1_pcie0_phy: phy@0 {
+				compatible = "zte,zx279128s-pcie-phy";
+				reg = <0>;
+				#phy-cells = <0>;
+			};
+
+			crm1_pcie1_phy: phy@1 {
+				compatible = "zte,zx279128s-pcie-phy";
+				reg = <1>;
+				#phy-cells = <0>;
+			};
+
+			/* SoC restart (topcrm offset 0x44, mask/value 0x1). */
+			reboot {
+				compatible = "syscon-reboot";
+				offset = <0x44>;
+				mask = <0x1>;
+				value = <0x1>;
+			};
+		};
+	};
+};
+
+&pcie0 {
+	phys = <&crm1_pcie0_phy>;
+	phy-names = "pcie";
+	status = "okay";
+};
+
+&pcie1 {
+	phys = <&crm1_pcie1_phy>;
+	phy-names = "pcie";
+	status = "okay";
+};
+
+/* Stock kernel ships "# CONFIG_USB is not set"; keep USB off for the same
+ * hang-safety reason the sibling ports did. */
+&usb {
+	status = "disabled";
+};
+
+/* Serialize PL310 maintenance with protected MMIO, same as the siblings. */
+&l2cc {
+	zte,l2c-io-read-lock;
+};

@@ -1,0 +1,96 @@
+name: Build experimental RAX3000-Z firmware
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: rax3000z-firmware-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    permissions:
+      contents: write
+    env:
+      E2631_TREE: ${{ github.workspace }}/../openwrt
+      E2631_OUT: ${{ github.workspace }}/../out
+      E2631_VERSION: RAX3000Z v0.1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.16.0'
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          # Same Azure-DNS workaround the E2631 workflow needs (runner-side only).
+          if ! timeout 8 getent ahosts archive.ubuntu.com >/dev/null 2>&1; then
+            sudo sh -c '{ printf "%s\n" "nameserver 8.8.8.8"; cat /etc/resolv.conf; } > /etc/resolv.conf.new && mv /etc/resolv.conf.new /etc/resolv.conf'
+          fi
+          sudo sed -i 's|azure\.archive\.ubuntu\.com|archive.ubuntu.com|g' /etc/apt/apt-mirrors.txt || true
+          for f in /etc/apt/sources.list.d/*.sources; do
+            [ -f "$f" ] || continue
+            sudo sed -i 's|mirror+file:/etc/apt/apt-mirrors.txt|http://archive.ubuntu.com/ubuntu/|g' "$f"
+          done
+          APT_OPTS="-o Acquire::Retries=10 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30"
+          ok=0
+          for attempt in 1 2 3; do
+            if sudo apt-get $APT_OPTS update; then ok=1; break; fi
+            sleep 10
+          done
+          [ "$ok" = 1 ] || { echo "::error::apt-get update failed after 3 attempts"; exit 1; }
+          sudo apt-get $APT_OPTS install -y \
+            build-essential clang flex bison g++ gawk gcc-multilib gettext git \
+            libncurses-dev libssl-dev python3 python3-setuptools rsync swig unzip \
+            zlib1g-dev file wget curl busybox libelf-dev xsltproc
+      - name: Bootstrap pinned OpenWrt base (clone + overlay + feeds)
+        # bootstrap seeds the RAX1800-Z config and passes its own gate; we then
+        # re-seed for RAX3000-Z below.  Everything it sets up (base tree, feeds,
+        # overlay, env) is device-agnostic and reused as-is.
+        run: make bootstrap
+      - name: Re-seed .config for the RAX3000-Z and expand
+        run: |
+          set -euo pipefail
+          cp seed/rax3000z.config "$E2631_TREE/.config"
+          ( cd "$E2631_TREE" && make defconfig )
+          grep -q '^CONFIG_TARGET_DEVICE_sanechips_generic_DEVICE_cmcc_rax3000-z=y' "$E2631_TREE/.config" \
+            || { echo "::error::RAX3000-Z device not selected after defconfig"; exit 1; }
+          grep -q '^CONFIG_SOFT_FLOAT=y' "$E2631_TREE/.config" \
+            || { echo "::error::soft-float not set - would SIGILL on this SoC"; exit 1; }
+          echo "RAX3000-Z selected, soft-float on."
+      - name: Build firmware (make world)
+        # Direct make, not scripts/build.sh (that one asserts the RAX1800-Z device).
+        run: |
+          set -euo pipefail
+          ( cd "$E2631_TREE" && make -j"$(nproc)" world V=s ) 2>&1 | tee world.log | \
+            grep -vE '^(make\[|  )' || true
+          test -d "$E2631_TREE/bin/targets/sanechips/generic" \
+            || { echo "::error::no image output dir"; tail -40 world.log; exit 1; }
+      - name: Collect RAX3000-Z images
+        id: collect
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          find "$E2631_TREE/bin/targets" -type f \
+            \( -name '*rax3000*' -o -name 'config-6.18' -o -name 'sha256sums' \) \
+            -exec cp {} release/ \; || true
+          ls -l "$E2631_TREE/bin/targets/sanechips/generic/" > release/IMAGE-LIST.txt 2>/dev/null || true
+          {
+            echo "Kit commit: $GITHUB_SHA"
+            echo "Base commit: $(git -C "$E2631_TREE" rev-parse HEAD 2>/dev/null || echo '?')"
+            echo "Run: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "Hardware tested: NO"
+          } > release/SOURCE-INFO.txt
+          ( cd release && sha256sum * > SHA256SUMS 2>/dev/null || true )
+          echo "--- collected ---"; ls -l release/
+      - name: Upload RAX3000-Z firmware + logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rax3000z-firmware-${{ github.run_id }}
+          path: |
+            release/
+            world.log
+          if-no-files-found: warn
+          retention-days: 14
