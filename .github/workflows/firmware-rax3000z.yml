@@ -63,10 +63,17 @@ jobs:
         # Direct make, not scripts/build.sh (that one asserts the RAX1800-Z device).
         run: |
           set -euo pipefail
-          ( cd "$E2631_TREE" && make -j"$(nproc)" world V=s ) 2>&1 | tee world.log | \
-            grep -vE '^(make\[|  )' || true
-          test -d "$E2631_TREE/bin/targets/sanechips/generic" \
-            || { echo "::error::no image output dir"; tail -40 world.log; exit 1; }
+          cd "$E2631_TREE"
+          # Capture make's real exit status (no pipe masking); on failure dump a
+          # single-threaded verbose re-run so the error is readable in the log.
+          if ! make -j"$(nproc)" world V=s > "$GITHUB_WORKSPACE/world.log" 2>&1; then
+            echo "::error::make world failed - verbose tail:"
+            tail -120 "$GITHUB_WORKSPACE/world.log"
+            exit 1
+          fi
+          # A green build must actually have produced the device image.
+          ls bin/targets/sanechips/generic/*cmcc_rax3000-z*sysupgrade* >/dev/null 2>&1 \
+            || { echo "::error::no RAX3000-Z sysupgrade image produced"; ls -l bin/targets/sanechips/generic/ || true; exit 1; }
       - name: Collect RAX3000-Z images
         id: collect
         run: |

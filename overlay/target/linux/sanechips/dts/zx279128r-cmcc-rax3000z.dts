@@ -13,7 +13,7 @@
  *  - 128 MiB parallel SLC NAND, Denali controller (stock DT
  *    "denali,denali-nand-dt"); chip is Toshiba TC58BVG0S3 / XT27G01B
  *  - 12 MTD partitions, byte-for-byte the RAX1800-Z offsets (read from
- *    /sys/class/mtd/mtd*/offset):
+ *    each partition's sysfs offset):
  *      u-boot        0x00000000  parameter-tags 0x04c00000
  *      kernel0       0x00200000  usercfg        0x04e00000
  *      kernel1       0x00700000  others         0x05300000
